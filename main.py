@@ -1,118 +1,102 @@
-import os
-import requests
-import re
+import os, re, threading, requests
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from web_server import keep_alive
-import database as db
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from pymongo import MongoClient
 
-# --- Anilist Fetcher (No API Key Required) ---
-def get_anilist_info(query):
-    gql_query = """
-    query ($search: String) {
-      Media (search: $search, type: ANIME) {
-        title { english romaji }
-        description
-        averageScore
-        genres
-        bannerImage
-      }
-    }
-    """
-    url = 'https://graphql.anilist.co'
-    response = requests.post(url, json={'query': gql_query, 'variables': {'search': query}})
-    if response.status_code == 200:
-        return response.json()['data']['Media']
-    return None
+# --- CONFIG ---
+TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['AnimePostBot']
 
-# --- Formatting Helper ---
-def format_post(name, ep, info, links):
-    desc = info['description'].replace('<br>', '').replace('<i>', '').replace('</i>', '')
-    # Hide half of synopsis
-    mid = len(desc) // 2
-    synopsis = f"{desc[:mid]}||{desc[mid:]}||"
-    
-    # Text in Bold as requested
-    text = (
-        f"<b>{name} Episode {ep}</b>\n"
-        f"⟣────────────────────⟢\n"
-        f"<b>‣ Audio ⌯ [Chinese | Eng-Sub]</b>\n"
-        f"<b>‣ Rating ⌯ {info['averageScore']/10} IMDB</b>\n"
-        f"<b>‣ Quality ⌯ 480p | 720p | 1080p</b>\n"
-        f"<b>‣ Episode ⌯ {ep}</b>\n"
-        f"<b>‣ Genres ⌯ {', '.join(['#'+g for g in info['genres']])}</b>\n"
-        f"⟣────────────────────⟢\n"
-        f"<b>‣ Synopsis ⌯</b>\n"
-        f"<b>{synopsis}</b>\n\n"
-        f"🔗 <b>Our Network @Donghua_Xin</b>"
-    )
-    
-    # Create buttons from links
-    keyboard = []
-    link_pairs = re.findall(r'(\d+p)\s*:\s*(https?://\S+)', links)
-    for q, l in link_pairs:
-        keyboard.append([InlineKeyboardButton(f"🚀 {q} Download", url=l)])
-    
-    return text, InlineKeyboardMarkup(keyboard)
+# --- HEALTH CHECK SERVER (For Koyeb) ---
+app = Flask(__name__)
+@app.route('/')
+def health(): return "OK", 200
+def run_web(): app.run(host='0.0.0.0', port=8000)
 
-# --- Bot Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("<b>Welcome! Use /addchannel to setup and /post to create.</b>", parse_mode='HTML')
-
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("<b>Usage: /addchannel -100123456 NameTag</b>", parse_mode='HTML')
-    c_id, tag = context.args[0], " ".join(context.args[1:])
-    db.save_channel(update.effective_user.id, c_id, tag)
-    await update.message.reply_text(f"<b>Channel {tag} added!</b>", parse_mode='HTML')
-
-async def post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Format: /post Name | Ep | ImgLink | Links (480p: url 720p: url)
+# --- ANILIST FETCH (No Key Required) ---
+def get_info(query):
+    gql = 'query($s:String){Media(search:$s,type:ANIME){title{romaji english}descriptionaverageScoregenresbannerImagecoverImage{extraLarge}}}'
     try:
-        parts = update.message.text.split('|')
-        name, ep, img, links = parts[0].replace('/post', '').strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-        
-        info = db.get_anime_data(name)
-        if not info:
-            info = get_anilist_info(name)
-            db.save_anime_data(name, info)
-        
-        text, markup = format_post(name, ep, info, links)
-        context.user_data['pending_post'] = (text, markup, img)
-        
-        # Show channel selection
-        channels = db.get_channels(update.effective_user.id)
-        buttons = [[InlineKeyboardButton(c['name'], callback_data=f"sel_{c['channel_id']}")] for c in channels]
-        buttons.append([InlineKeyboardButton("✅ DONE", callback_data="done_post")])
-        
-        await update.message.reply_photo(photo=img, caption=text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode='HTML')
-    except:
-        await update.message.reply_text("<b>Error! Use: /post Name | Ep | Img | Quality: Link</b>", parse_mode='HTML')
+        r = requests.post('https://graphql.anilist.co', json={'query':gql, 'variables':{'s':query}})
+        return r.json()['data']['Media']
+    except: return None
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
+# --- BOT LOGIC ---
+async def start(u, c):
+    await u.message.reply_text("<b>Bot Active.</b>\n/addchannel [ID] [Tag]\n/post [Name] | [Ep] | [Links]", parse_mode='HTML')
+
+async def add_channel(u, c):
+    if len(c.args) < 2: return await u.message.reply_text("Usage: /addchannel -100xxx Name")
+    db.channels.update_one({"uid": u.effective_user.id, "cid": c.args[0]}, {"$set": {"tag": " ".join(c.args[1:])}}, upsert=True)
+    await u.message.reply_text("<b>Channel Added!</b>", parse_mode='HTML')
+
+async def post_cmd(u, c):
+    try:
+        # Input format: Name | Ep | Quality: Link Quality: Link
+        data = u.message.text.replace('/post','').strip().split('|')
+        name, ep, links_str = data[0].strip(), data[1].strip(), data[2].strip()
+        
+        info = db.cache.find_one({"n": name.lower()}) or get_info(name)
+        if not info: return await u.message.reply_text("Anime not found.")
+        db.cache.update_one({"n": name.lower()}, {"$set": info}, upsert=True)
+
+        desc = re.sub('<[^<]+?>', '', info.get('description', 'No Synopsis'))
+        mid = len(desc)//2
+        # FORMATTING: Bold everything, Hidden synopsis half-way
+        caption = (
+            f"<b>{info['title'].get('english') or info['title'].get('romaji')}</b>\n"
+            f"<b>⟣────────────────────⟢</b>\n"
+            f"<b>‣ Audio ⌯ [Chinese | Eng-Sub]</b>\n"
+            f"<b>‣ Rating ⌯ {info.get('averageScore', 0)/10} IMDB</b>\n"
+            f"<b>‣ Quality ⌯ 480p | 720p | 1080p</b>\n"
+            f"<b>‣ Episode ⌯ {ep}</b>\n"
+            f"<b>‣ Genres ⌯ {', '.join(['#'+g for g in info['genres']])}</b>\n"
+            f"<b>⟣────────────────────⟢</b>\n"
+            f"<b>‣ Synopsis ⌯</b>\n"
+            f"<b>{desc[:mid]}</b>||<b>{desc[mid:]}</b>||\n"
+            f"<b>🔗 Our Network @Donghua_Xin</b>"
+        )
+        img = info.get('bannerImage') or info['coverImage']['extraLarge']
+        
+        btns = []
+        for q, l in re.findall(r'(\d+p)\s*:\s*(https?://\S+)', links_str):
+            btns.append([InlineKeyboardButton(f"🚀 {q} Download", url=l)])
+        
+        c.user_data['p'] = {"t": caption, "i": img, "b": btns}
+        
+        # Channel Selection
+        ch_list = list(db.channels.find({"uid": u.effective_user.id}))
+        kb = [[InlineKeyboardButton(f"Post to: {ch['tag']}", callback_data=f"s_{ch['cid']}")] for ch in ch_list]
+        kb.append([InlineKeyboardButton("📢 Send All", callback_data="s_all")])
+        
+        await u.message.reply_photo(photo=img, caption=caption + "\n\n<b>Select Channel:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except Exception as e: await u.message.reply_text(f"Error: {e}")
+
+async def cb_handler(u, c):
+    q = u.callback_query
+    p = c.user_data.get('p')
+    if not p: return
     
-    if data.startswith("sel_"):
-        cid = data.split("_")[1]
-        selected = context.user_data.get('selected_channels', [])
-        if cid in selected: selected.remove(cid)
-        else: selected.append(cid)
-        context.user_data['selected_channels'] = selected
-        await query.answer("Channel Toggled")
-        
-    elif data == "done_post":
-        text, markup, img = context.user_data['pending_post']
-        for cid in context.user_data.get('selected_channels', []):
-            await context.bot.send_photo(chat_id=cid, photo=img, caption=text, reply_markup=markup, parse_mode='HTML')
-        await query.edit_message_caption("<b>✅ Posted successfully!</b>", parse_mode='HTML')
+    t_list = [ch['cid'] for ch in db.channels.find({"uid": u.effective_user.id})] if q.data == "s_all" else [q.data.replace('s_','')]
+    for target in t_list:
+        await c.bot.send_photo(chat_id=target, photo=p['i'], caption=p['t'], reply_markup=InlineKeyboardMarkup(p['b']), parse_mode='HTML')
+    await q.edit_message_caption("<b>✅ Sent Successfully!</b>", parse_mode='HTML')
 
-# --- Main Entry ---
+async def broadcast(u, c):
+    if not u.message.reply_to_message: return
+    for ch in db.channels.find({"uid": u.effective_user.id}):
+        await c.bot.copy_message(chat_id=ch['cid'], from_chat_id=u.message.chat_id, message_id=u.message.reply_to_message.message_id)
+    await u.message.reply_text("Broadcast Done.")
+
 if __name__ == '__main__':
-    keep_alive() # Start Koyeb Health Check
-    app = Application.builder().token(os.getenv("BOT_TOKEN")).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addchannel", add_channel))
-    app.add_handler(CommandHandler("post", post_handler))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.run_polling()
+    threading.Thread(target=run_web, daemon=True).start()
+    bot = Application.builder().token(TOKEN).build()
+    bot.add_handler(CommandHandler("start", start))
+    bot.add_handler(CommandHandler("addchannel", add_channel))
+    bot.add_handler(CommandHandler("post", post_cmd))
+    bot.add_handler(CommandHandler("broadcastall", broadcast))
+    bot.add_handler(CallbackQueryHandler(cb_handler))
+    bot.run_polling()
