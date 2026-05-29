@@ -5,16 +5,12 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from pymongo import MongoClient
 
 # --- HARDCODED CONFIGURATION ---
-TOKEN = os.getenv("BOT_TOKEN") # Keep Token in Env for Security
-MONGO_URI = os.getenv("MONGO_URI") # Keep Mongo in Env for Security
+TOKEN = os.getenv("BOT_TOKEN") 
+MONGO_URI = os.getenv("MONGO_URI") 
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-# HARDCODED API KEYS
 TMDB_KEY = "57c932b753612419360f21e739652579"
-OMDB_KEYS = [
-    "78aba0e3", "984f89be", "ce245f40", "2e8c5c65", 
-    "2451f643", "79803fd4", "f31bb8de"
-]
+OMDB_KEYS = ["78aba0e3", "984f89be", "ce245f40", "2e8c5c65", "2451f643", "79803fd4", "f31bb8de"]
 
 client = MongoClient(MONGO_URI)
 db = client['AnimePostBot']
@@ -27,26 +23,23 @@ def run_web(): app.run(host='0.0.0.0', port=8000)
 
 # --- CLEANING & METADATA LOGIC ---
 def clean_text(text):
-    if not text: return "No synopsis available."
-    # Remove HTML tags properly to avoid Telegram Parse Errors
+    if not text: return "No synopsis available for this title."
     text = re.sub(r'<(br|p|/p|br /)>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
     text = html.unescape(text)
-    # Remove AniList's "Note:" section often found in Donghuas
     text = re.sub(r'Note:.*', '', text, flags=re.IGNORECASE).strip()
     return text
 
 def get_omdb_rating(title):
     for key in OMDB_KEYS:
         try:
-            r = requests.get(f"http://www.omdbapi.com/?t={title}&apikey={key}").json()
-            if r.get('Response') == 'True':
-                return r.get('imdbRating', '8.4')
+            r = requests.get(f"http://www.omdbapi.com/?t={title}&apikey={key.strip()}").json()
+            if r.get('Response') == 'True': return r.get('imdbRating', '8.4')
         except: continue
     return "8.4"
 
 def get_metadata(query):
-    # 1. Try AniList First (Best for Donghua)
+    # 1. AniList (Donghua/Anime)
     gql = 'query($s:String){Media(search:$s,type:ANIME){title{english romaji}descriptionaverageScoregenresbannerImagecoverImage{extraLarge}}}'
     try:
         res = requests.post('https://graphql.anilist.co', json={'query':gql, 'variables':{'s':query}}).json()
@@ -61,7 +54,7 @@ def get_metadata(query):
             }
     except: pass
 
-    # 2. Fallback to TMDB (Best for Movies/Series)
+    # 2. TMDB (Movies)
     try:
         search = requests.get(f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_KEY}&query={query}").json()
         if search['results']:
@@ -70,61 +63,62 @@ def get_metadata(query):
                 "title": res.get('title') or res.get('name'),
                 "desc": clean_text(res.get('overview')),
                 "rating": str(res.get('vote_average', 8.4)),
-                "genres": ["Action", "Fantasy"],
-                "img": f"https://image.tmdb.org/t/p/original{res.get('backdrop_path')}"
+                "genres": ["Action", "Fantasy", "Movie"],
+                "img": f"https://image.tmdb.org/t/p/original{res.get('backdrop_path')}" if res.get('backdrop_path') else None
             }
     except: pass
     return None
 
 # --- BOT HANDLERS ---
 async def start(u, c):
-    await u.message.reply_text("<b>🚀 Bot Started Successfully!</b>\n\n<b>Commands:</b>\n/addchannel [ID] [Tag]\n/channels - List Channels\n/post Name | Ep | [Img] | Links\n/broadcastall - Reply to a message", parse_mode='HTML')
+    await u.message.reply_text("<b>🚀 Bot Active!</b>\n/addchannel [ID] [Tag]\n/post Name | Ep | [Img] | Links", parse_mode='HTML')
 
 async def add_channel(u, c):
-    if len(c.args) < 2: return await u.message.reply_text("<b>Format:</b> /addchannel -100xxx TagName")
+    if len(c.args) < 2: return await u.message.reply_text("Usage: /addchannel -100xxx Tag")
     db.channels.update_one({"uid": u.effective_user.id, "cid": c.args[0]}, {"$set": {"tag": " ".join(c.args[1:])}}, upsert=True)
     await u.message.reply_text("<b>✅ Channel Added!</b>", parse_mode='HTML')
 
 async def list_channels(u, c):
     chs = list(db.channels.find({"uid": u.effective_user.id}))
-    if not chs: return await u.message.reply_text("No channels added.")
+    if not chs: return await u.message.reply_text("No channels.")
     kb = [[InlineKeyboardButton(f"❌ Remove {ch['tag']}", callback_data=f"rm_{ch['cid']}")] for ch in chs]
-    await u.message.reply_text("<b>Manage your channels:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    await u.message.reply_text("<b>Manage Channels:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
 
 async def post_cmd(u, c):
     try:
-        # Split by |
         parts = [p.strip() for p in u.message.text.replace('/post','').split('|')]
         name_input = parts[0]
         ep = parts[1] if len(parts) > 1 else "01"
         
-        user_img = None
-        links_text = ""
-        
-        # Determine if Img is provided
+        user_img, links_text = None, ""
         if len(parts) >= 4:
-            user_img = parts[2]
-            links_text = parts[3]
+            user_img, links_text = parts[2], parts[3]
         elif len(parts) == 3:
             if parts[2].startswith("http") and "p:" not in parts[2]: user_img = parts[2]
             else: links_text = parts[2]
 
-        # Fetch Meta & Handle Image Memory
-        meta = db.cache.find_one({"n": name_input.lower()}) or get_metadata(name_input)
-        if not meta: return await u.message.reply_text("❌ Could not find details.")
-        db.cache.update_one({"n": name_input.lower()}, {"$set": meta}, upsert=True)
+        # 1. Cache-Safe Metadata Fetch
+        meta = db.cache.find_one({"n": name_input.lower()})
+        # If cache exists but is old format (missing 'desc'), refresh it
+        if not meta or 'desc' not in meta:
+            meta = get_metadata(name_input)
+            if meta: db.cache.update_one({"n": name_input.lower()}, {"$set": meta}, upsert=True)
+        
+        if not meta: return await u.message.reply_text("❌ Title not found.")
 
+        # 2. Image Memory Logic
         if user_img:
             db.media.update_one({"n": name_input.lower()}, {"$set": {"img": user_img}}, upsert=True)
             final_img = user_img
         else:
             saved = db.media.find_one({"n": name_input.lower()})
-            final_img = saved['img'] if saved else meta['img']
+            final_img = saved['img'] if saved else meta.get('img')
 
-        # Formatting Content
+        # 3. Formatting
         imdb = get_omdb_rating(name_input)
-        mid = len(meta['desc'])//2
-        synopsis = f"{meta['desc'][:mid]}<tg-spoiler>{meta['desc'][mid:]}</tg-spoiler>"
+        description = meta.get('desc', 'No synopsis available.')
+        mid = len(description)//2
+        synopsis = f"{description[:mid]}<tg-spoiler>{description[mid:]}</tg-spoiler>"
         
         quals = re.findall(r'(\d+p|4K)', links_text, re.I)
         q_label = " | ".join(sorted(list(set(quals)))) if quals else "480p | 720p | 1080p"
@@ -136,24 +130,20 @@ async def post_cmd(u, c):
             f"<b>‣ Rating ⌯ {imdb} IMDB | 96% User Score</b>\n"
             f"<b>‣ Quality ⌯ {q_label}</b>\n"
             f"<b>‣ Episode ⌯ {ep}</b>\n"
-            f"<b>‣ Genres ⌯ {', '.join(['#'+g.replace(' ','_') for g in meta['genres']])}</b>\n"
+            f"<b>‣ Genres ⌯ {', '.join(['#'+g.replace(' ','_') for g in meta.get('genres', [])])}</b>\n"
             f"<b>⟣────────────────────⟢</b>\n"
             f"<b>‣ Synopsis ⌯</b>\n"
             f"<blockquote><b>{synopsis}</b></blockquote>\n"
             f"<b>🔗 Our Network @Donghua_Xin</b>"
         )
 
-        # Build Link Buttons (Grid style 2 per row)
+        # 4. Buttons (Grid 2 per row)
         btns = []
-        links_found = re.findall(r'(\d+p|4K)\s*:\s*(https?://\S+)', links_text, re.I)
-        for label, url in links_found:
-            btns.append(InlineKeyboardButton(f"🚀 {label.upper()} Download", url=url))
+        for q, l in re.findall(r'(\d+p|4K)\s*:\s*(https?://\S+)', links_text, re.I):
+            btns.append(InlineKeyboardButton(f"🚀 {q.upper()} Download", url=l))
         
-        # Save temp data for this user
         c.user_data['post_data'] = {
-            "caption": caption, 
-            "image": final_img, 
-            "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)]
+            "caption": caption, "image": final_img, "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)]
         }
         c.user_data['selected_channels'] = []
 
@@ -162,8 +152,8 @@ async def post_cmd(u, c):
         kb = [[InlineKeyboardButton(ch['tag'], callback_data=f"sel_{ch['cid']}")] for ch in chs]
         kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
 
-        await u.message.reply_photo(photo=final_img, caption=caption + "\n\n<b>Select channels to post:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except Exception as e: await u.message.reply_text(f"Error: {e}")
+        await u.message.reply_photo(photo=final_img, caption=caption + "\n\n<b>Select channels:</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except Exception as e: await u.message.reply_text(f"<b>Error:</b> {e}", parse_mode='HTML')
 
 async def callback_handler(u, c):
     q = u.callback_query
@@ -172,7 +162,7 @@ async def callback_handler(u, c):
 
     if data.startswith("rm_"):
         db.channels.delete_one({"uid": uid, "cid": data.replace("rm_","")})
-        return await q.edit_message_text("Channel Removed.")
+        return await q.edit_message_text("Removed.")
 
     if data.startswith("sel_"):
         cid = data.replace("sel_", "")
@@ -181,7 +171,6 @@ async def callback_handler(u, c):
         else: selected.append(cid)
         c.user_data['selected_channels'] = selected
         
-        # Refresh buttons with checkmarks
         chs = list(db.channels.find({"uid": uid}))
         new_kb = []
         for ch in chs:
@@ -193,17 +182,15 @@ async def callback_handler(u, c):
     if data == "final_send":
         p = c.user_data.get('post_data')
         sel = c.user_data.get('selected_channels', [])
-        if not sel: return await q.answer("❌ Select at least one channel!", show_alert=True)
+        if not sel: return await q.answer("❌ Select a channel!", show_alert=True)
         
         for cid in sel:
             try: await c.bot.send_photo(chat_id=cid, photo=p['image'], caption=p['caption'], reply_markup=InlineKeyboardMarkup(p['buttons']), parse_mode='HTML')
             except: pass
-        await q.edit_message_caption("<b>✅ Posted Successfully!</b>", parse_mode='HTML')
+        await q.edit_message_caption("<b>✅ Successfully Sent!</b>", parse_mode='HTML')
 
 async def broadcast(u, c):
-    if u.effective_user.id != OWNER_ID or not u.message.reply_to_message:
-        return await u.message.reply_text("Restricted Command.")
-    
+    if u.effective_user.id != OWNER_ID or not u.message.reply_to_message: return
     chs = list(db.channels.find({"uid": u.effective_user.id}))
     for ch in chs:
         try: await c.bot.copy_message(chat_id=ch['cid'], from_chat_id=u.message.chat_id, message_id=u.message.reply_to_message.message_id)
