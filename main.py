@@ -144,7 +144,14 @@ async def file_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     file = u.message.document or u.message.video
     if not file: return
     db_msg = await u.message.copy(chat_id=DB_CHANNEL_ID)
-    c.user_data['temp_files'].append({"msg_id": db_msg.message_id, "name": file.file_name or "Video File"})
+    real_name = u.message.caption or getattr(file, "file_name", None) or "Unknown"
+    title_tmp, ep_tmp, quality_tmp, year_tmp = advanced_title_cleaner(real_name)
+    c.user_data['temp_files'].append({
+        "msg_id": db_msg.message_id,
+        "name": real_name,
+        "quality": quality_tmp,
+        "episode": ep_tmp
+    })
     kb = [[InlineKeyboardButton("➕ Add More", callback_data="add_more")], [InlineKeyboardButton("✅ Done", callback_data="finish_auto")]]
     await u.message.reply_text(f"📥 Added {len(c.user_data['temp_files'])}.", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -156,11 +163,14 @@ async def cb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         files, mode = c.user_data['temp_files'], c.user_data['mode']
         await q.edit_message_text("🔄 AI Searching Metadata...")
         title, ep, quality, year = advanced_title_cleaner(files[0]['name'])
+        qualities = sorted(list(set(f.get("quality","HD") for f in files)))
+        quality = " | ".join(qualities)
         meta = get_metadata(title, year, mode) or {"title": title, "desc": "N/A", "rating": "N/A", "genres": "#Store", "img": None}
 
         btns = []
         for f in files:
-            _, f_ep, f_q, _ = advanced_title_cleaner(f['name'])
+            f_ep = f.get("episode", "Full")
+            f_q = f.get("quality", "HD")
             res = files_db.insert_one({"msg_id": f['msg_id'], "name": f['name']})
             link_id = base64.urlsafe_b64encode(str(res.inserted_id).encode()).decode().rstrip("=")
             btns.append(InlineKeyboardButton(f"🚀 {f_q} [{f_ep}]", url=f"https://t.me/{BOT_USERNAME}?start={link_id}"))
