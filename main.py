@@ -16,14 +16,14 @@ OMDB_KEYS = ["78aba0e3", "984f89be", "ce245f40", "2e8c5c65", "2451f643", "79803f
 
 client = MongoClient(MONGO_URI)
 db = client['AnimePostBot']
-files_db = db['StoredFiles'] # New collection for files
+files_db = db['StoredFiles'] 
 
 app = Flask(__name__)
 @app.route('/')
 def health(): return "Bot is Online", 200
 def run_web(): app.run(host='0.0.0.0', port=8000)
 
-# --- UTILS (KEPT FROM ORIGINAL) ---
+# --- UTILS ---
 def clean_text(text):
     if not text: return "No synopsis available."
     text = re.sub(r'<(br|p|/p|br /)>', '\n', text, flags=re.IGNORECASE)
@@ -46,11 +46,10 @@ def get_omdb_rating(title):
     return {"imdb": "7.5", "rt": "90%", "year": "N/A"}
 
 def get_metadata(query, med_type="anime"):
+    # Clean the search query for better API matching (Fixes "Otaku no Video" issue)
     search_query = re.sub(r'\s(s\d+|season\s?\d+)', '', query, flags=re.I).strip()
-    year_match = re.search(r'\b(19|20)\d{2}\b', search_query)
-    year = year_match.group(0) if year_match else None
-    if year: search_query = search_query.replace(year, "").strip()
-
+    search_query = re.sub(r'\b(3D|2D|4K|Full|BD|1080p|720p|480p|800p)\b', '', search_query, flags=re.I).strip()
+    
     if med_type == "anime":
         gql = 'query($s:String){Media(search:$s,type:ANIME){title{english romaji}description averageScore genres bannerImage coverImage{extraLarge}}}'
         try:
@@ -68,7 +67,6 @@ def get_metadata(query, med_type="anime"):
     tmdb_path = "movie" if med_type == "movie" else "tv" if med_type == "series" else "multi"
     try:
         url = f"https://api.themoviedb.org/3/search/{tmdb_path}?api_key={TMDB_KEY}&query={search_query}"
-        if year: url += f"&year={year}"
         search = requests.get(url).json()
         if search['results']:
             res = search['results'][0]
@@ -101,7 +99,7 @@ def build_caption(t, mode):
     if len(synopsis) > max_synopsis: synopsis = synopsis[:max_synopsis] + "..."
     return f"{header}<blockquote expandable><b>{synopsis}</b></blockquote>{footer}"
 
-# --- NEW FILE STORE UTILS ---
+# --- FILE STORE UTILS ---
 def encode_id(db_id):
     return base64.urlsafe_b64encode(str(db_id).encode()).decode().rstrip("=")
 
@@ -110,15 +108,11 @@ def decode_id(code):
     return base64.urlsafe_b64decode((code + padding).encode()).decode()
 
 def parse_auto_name(filename):
-    # Regex for: Title - Episode 77 (360p)
     filename = re.sub(r'\.(mp4|mkv|zip|rar|ts)$', '', filename, flags=re.I)
     quality_match = re.search(r'(\d+p|4K)', filename, re.I)
     ep_match = re.search(r'(?:Episode|Ep)\s*(\d+)', filename, re.I)
-    
     quality = quality_match.group(1) if quality_match else "HD"
     episode = ep_match.group(1) if ep_match else "Full"
-    
-    # Clean Title
     title = filename
     if ep_match: title = title.replace(ep_match.group(0), "")
     if quality_match: title = title.replace(f"({quality_match.group(0)})", "").replace(quality_match.group(0), "")
@@ -127,7 +121,7 @@ def parse_auto_name(filename):
 
 # --- BOT HANDLERS ---
 async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if c.args: # File Store Retrieval
+    if c.args: 
         try:
             file_id = decode_id(c.args[0])
             data = files_db.find_one({"_id": file_id})
@@ -138,14 +132,15 @@ async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "<b>🚀 Post Bot Commands:</b>\n\n"
-        "<b>1. /post</b> - Auto Anime File Store\n"
-        "<b>2. /movie</b> - Auto Movie File Store\n"
-        "<b>3. /webseries Name | Ep/Season | [Img] | Audio | Links</b> (Manual)\n\n"
-        "<b>Admin:</b> /broadcast, /broadcastall, /addchannel, /channels"
+        "<b>1. /post</b> - Auto Anime Files\n"
+        "<b>2. /movie</b> - Auto Movie Files\n"
+        "<b>3. /webseries</b> - Manual (Name | Ep | Img | Audio | Links)\n"
+        "<b>4. /broadcast</b> - Select channels to broadcast (Reply to msg)\n"
+        "<b>5. /broadcastall</b> - Broadcast to ALL (Reply to msg)\n"
+        "<b>Admin:</b> /addchannel [ID] [anime/movie/series] [Tag], /channels"
     )
     await u.message.reply_text(msg, parse_mode='HTML')
 
-# --- NEW AUTO POST LOGIC ---
 async def auto_post_start(u: Update, c: ContextTypes.DEFAULT_TYPE, mode):
     if u.effective_user.id != OWNER_ID: return
     c.user_data['is_auto'] = True
@@ -157,53 +152,10 @@ async def file_receiver(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not c.user_data.get('is_auto'): return
     file = u.message.document or u.message.video
     if not file: return
-
-    # Forward to DB Channel
     db_msg = await u.message.copy(chat_id=DB_CHANNEL_ID)
-    c.user_data['temp_files'].append({
-        "msg_id": db_msg.message_id,
-        "name": file.file_name if hasattr(file, 'file_name') else "Video File"
-    })
-
-    kb = [[InlineKeyboardButton("➕ Send More", callback_data="add_more")],
-          [InlineKeyboardButton("✅ Done", callback_data="auto_done")]]
+    c.user_data['temp_files'].append({"msg_id": db_msg.message_id, "name": file.file_name if hasattr(file, 'file_name') else "Video File"})
+    kb = [[InlineKeyboardButton("➕ Send More", callback_data="add_more")], [InlineKeyboardButton("✅ Done", callback_data="auto_done")]]
     await u.message.reply_text(f"📥 Added: {len(c.user_data['temp_files'])} files", reply_markup=InlineKeyboardMarkup(kb))
-
-# --- KEPT ORIGINAL WEBSERIES LOGIC ---
-async def webseries_manual(u, c):
-    try:
-        raw = u.message.text.split(None, 1)[1]
-        parts = [p.strip() for p in raw.split('|')]
-        name = parts[0]
-        ep = parts[1] if len(parts) > 1 else "Season 01"
-        img_user, audio, links = None, "Hindi & English", ""
-        if len(parts) > 4: img_user, audio, links = parts[2], parts[3], parts[4]
-        elif len(parts) == 4: audio, links = parts[2], parts[3]
-        elif len(parts) == 3: links = parts[2]
-
-        meta = get_metadata(name, "series")
-        if not meta: return await u.message.reply_text("❌ Title not found.")
-        
-        final_img = img_user if (img_user and img_user.startswith("http")) else meta.get('img')
-        q_list = re.findall(r'(\d+p|4K)', links, re.I)
-        q_label = " | ".join(sorted(list(set(q_list)))) if q_list else "480p | 720p | 1080p"
-        
-        template_data = {
-            "title": meta['title'], "audio": audio, "rating": f"7.5 IMDb | 90% RT",
-            "quality": q_label, "extra_label": "Episode", "extra_val": ep,
-            "genres": " ".join(['#'+g.replace(' ','_') for g in meta.get('genres', [])]),
-            "synopsis": meta['desc']
-        }
-        caption = build_caption(template_data, "series")
-        btns = [InlineKeyboardButton(f"🚀 {q.upper()} Download", url=l) for q, l in re.findall(r'(\d+p|4K)\s*:\s*(https?://\S+)', links, re.I)]
-        
-        c.user_data['post_data'] = {"caption": caption, "image": final_img, "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)]}
-        c.user_data['selected_channels'] = []
-        chs = list(db.channels.find({"uid": u.effective_user.id}))
-        kb = [[InlineKeyboardButton(ch['tag'], callback_data=f"sel_{ch['cid']}")] for ch in chs]
-        kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
-        await u.message.reply_photo(photo=final_img, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
-    except Exception as e: await u.message.reply_text(f"Error: {e}")
 
 async def callback_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
@@ -215,11 +167,9 @@ async def callback_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     elif q.data == "auto_done":
         files = c.user_data.get('temp_files', [])
         mode = c.user_data.get('auto_mode')
-        if not files: return await q.answer("No files!")
-        
         await q.edit_message_text("🔄 Processing metadata...")
-        title, ep, _ = parse_auto_name(files[0]['name'])
-        meta = get_metadata(title, mode) or {"title": title, "desc": "N/A", "rating": "8.0", "genres": [], "img": None}
+        raw_title, ep, _ = parse_auto_name(files[0]['name'])
+        meta = get_metadata(raw_title, mode) or {"title": raw_title, "desc": "N/A", "rating": "8.0", "genres": [], "img": None}
         
         btns = []
         for f in files:
@@ -228,38 +178,31 @@ async def callback_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             link = f"https://t.me/{BOT_USERNAME}?start={encode_id(res.inserted_id)}"
             btns.append(InlineKeyboardButton(f"🚀 {f_q} [Ep {f_ep}]", url=link))
             
-        ratings = get_omdb_rating(title)
+        ratings = get_omdb_rating(meta['title'])
         template_data = {
-            "title": meta['title'], 
-            "audio": "Hindi | English" if mode == "movie" else "Chinese | Eng-Sub",
+            "title": meta['title'], "audio": "Hindi | English" if mode == "movie" else "Chinese | Eng-Sub",
             "rating": f"{ratings['imdb']} IMDb" if mode == "movie" else f"{meta['rating']} / 10",
-            "quality": "480p | 720p | 1080p", 
-            "extra_label": "Released" if mode == "movie" else "Episode",
+            "quality": "480p | 720p | 1080p", "extra_label": "Released" if mode == "movie" else "Episode",
             "extra_val": ratings['year'] if mode == "movie" else ep,
-            "genres": " ".join(['#'+g.replace(' ','_') for g in meta.get('genres', [])]),
-            "synopsis": meta['desc']
+            "genres": " ".join(['#'+g.replace(' ','_') for g in meta.get('genres', [])]), "synopsis": meta['desc']
         }
-        
-        c.user_data['post_data'] = {
-            "caption": build_caption(template_data, mode),
-            "image": meta['img'],
-            "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)]
-        }
-        c.user_data['selected_channels'] = []
-        chs = list(db.channels.find({"uid": uid}))
+        c.user_data['post_data'] = {"caption": build_caption(template_data, mode), "image": meta['img'], "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)], "mode": mode}
+        chs = list(db.channels.find({"uid": OWNER_ID, "type": mode}))
         kb = [[InlineKeyboardButton(ch['tag'], callback_data=f"sel_{ch['cid']}")] for ch in chs]
         kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
-        await q.message.reply_photo(photo=meta['img'], caption=c.user_data['post_data']['caption'], reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        if meta['img']: await q.message.reply_photo(photo=meta['img'], caption=c.user_data['post_data']['caption'], reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+        else: await q.message.reply_text(c.user_data['post_data']['caption'], reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
 
-    # --- REMAINING ORIGINAL CALLBACK LOGIC (Channel Selection & Send) ---
     elif q.data.startswith("sel_"):
-        selected = c.user_data.get('selected_channels', [])
+        sel = c.user_data.get('selected_channels', [])
         cid = q.data.replace("sel_", "")
-        if cid in selected: selected.remove(cid)
-        else: selected.append(cid)
-        c.user_data['selected_channels'] = selected
-        chs = list(db.channels.find({"uid": uid}))
-        new_kb = [[InlineKeyboardButton(f"{'✅ ' if ch['cid'] in selected else ''}{ch['tag']}", callback_data=f"sel_{ch['cid']}")] for ch in chs]
+        if cid in sel: sel.remove(cid)
+        else: sel.append(cid)
+        c.user_data['selected_channels'] = sel
+        mode = c.user_data.get('post_data', {}).get('mode')
+        # If it's a broadcast (no mode), show all
+        chs = list(db.channels.find({"uid": OWNER_ID})) if not mode else list(db.channels.find({"uid": OWNER_ID, "type": mode}))
+        new_kb = [[InlineKeyboardButton(f"{'✅ ' if ch['cid'] in sel else ''}{ch['tag']}", callback_data=f"sel_{ch['cid']}")] for ch in chs]
         new_kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
         await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_kb))
 
@@ -270,45 +213,66 @@ async def callback_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         count = 0
         for cid in sel:
             try:
-                if bc_mid:
-                    await c.bot.copy_message(chat_id=cid, from_chat_id=c.user_data['bc_chat'], message_id=bc_mid)
-                else:
-                    await c.bot.send_photo(chat_id=cid, photo=post['image'], caption=post['caption'], reply_markup=InlineKeyboardMarkup(post['buttons']), parse_mode='HTML')
+                if bc_mid: await c.bot.copy_message(chat_id=cid, from_chat_id=c.user_data['bc_chat'], message_id=bc_mid)
+                else: await c.bot.send_photo(chat_id=cid, photo=post['image'], caption=post['caption'], reply_markup=InlineKeyboardMarkup(post['buttons']), parse_mode='HTML')
                 count += 1
             except: continue
-        await q.message.reply_text(f"✅ Sent to {count} channels!")
+        await q.message.reply_text(f"✅ Successfully Sent to {count} channels!")
 
-    elif q.data.startswith("rm_"):
-        db.channels.delete_one({"uid": uid, "cid": q.data.replace("rm_","")})
-        await q.edit_message_text("Removed.")
+# --- ORIGINAL MANUAL & BROADCAST COMMANDS ---
+async def webseries_manual(u, c):
+    if u.effective_user.id != OWNER_ID: return
+    try:
+        raw = u.message.text.split(None, 1)[1]
+        parts = [p.strip() for p in raw.split('|')]
+        name = parts[0]
+        ep = parts[1] if len(parts) > 1 else "Season 01"
+        img_user, audio, links = None, "Hindi & English", ""
+        if len(parts) > 4: img_user, audio, links = parts[2], parts[3], parts[4]
+        elif len(parts) == 4: audio, links = parts[2], parts[3]
+        elif len(parts) == 3: links = parts[2]
+        meta = get_metadata(name, "series")
+        final_img = img_user if (img_user and img_user.startswith("http")) else meta.get('img')
+        template_data = {"title": meta['title'], "audio": audio, "rating": "7.5 IMDb | 90% RT", "quality": "480p | 720p | 1080p", "extra_label": "Episode", "extra_val": ep, "genres": " ".join(['#'+g.replace(' ','_') for g in meta.get('genres', [])]), "synopsis": meta['desc']}
+        caption = build_caption(template_data, "series")
+        btns = [InlineKeyboardButton(f"🚀 {q.upper()} Download", url=l) for q, l in re.findall(r'(\d+p|4K)\s*:\s*(https?://\S+)', links, re.I)]
+        c.user_data['post_data'] = {"caption": caption, "image": final_img, "buttons": [btns[i:i + 2] for i in range(0, len(btns), 2)], "mode": "series"}
+        chs = list(db.channels.find({"uid": OWNER_ID, "type": "series"}))
+        kb = [[InlineKeyboardButton(ch['tag'], callback_data=f"sel_{ch['cid']}")] for ch in chs]
+        kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
+        await u.message.reply_photo(photo=final_img, caption=caption, reply_markup=InlineKeyboardMarkup(kb), parse_mode='HTML')
+    except Exception as e: await u.message.reply_text(f"Error: {e}")
 
-# --- KEPT ORIGINAL COMMANDS ---
 async def broadcast_cmd(u, c):
     if u.effective_user.id != OWNER_ID or not u.message.reply_to_message: return
     c.user_data['bc_msg'] = u.message.reply_to_message.message_id
     c.user_data['bc_chat'] = u.message.chat_id
+    c.user_data['post_data'] = None
     c.user_data['selected_channels'] = []
-    chs = list(db.channels.find({"uid": u.effective_user.id}))
-    kb = [[InlineKeyboardButton(ch['tag'], callback_data=f"sel_{ch['cid']}")] for ch in chs]
+    chs = list(db.channels.find({"uid": OWNER_ID}))
+    kb = [[InlineKeyboardButton(f"[{ch['type']}] {ch['tag']}", callback_data=f"sel_{ch['cid']}")] for ch in chs]
     kb.append([InlineKeyboardButton("🚀 SEND NOW", callback_data="final_send")])
     await u.message.reply_text("Select channels for broadcast:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def broadcast_all(u, c):
     if u.effective_user.id != OWNER_ID or not u.message.reply_to_message: return
-    chs = list(db.channels.find({"uid": u.effective_user.id}))
+    chs = list(db.channels.find({"uid": OWNER_ID}))
+    count = 0
     for ch in chs:
-        try: await c.bot.copy_message(chat_id=ch['cid'], from_chat_id=u.message.chat_id, message_id=u.message.reply_to_message.message_id)
-        except: pass
-    await u.message.reply_text("Done.")
+        try:
+            await c.bot.copy_message(chat_id=ch['cid'], from_chat_id=u.message.chat_id, message_id=u.message.reply_to_message.message_id)
+            count += 1
+        except: continue
+    await u.message.reply_text(f"✅ Broadcasted to all {count} channels.")
 
 async def add_channel(u, c):
-    if len(c.args) < 2: return await u.message.reply_text("Usage: /addchannel ID Tag")
-    db.channels.update_one({"uid": u.effective_user.id, "cid": c.args[0]}, {"$set": {"tag": " ".join(c.args[1:])}}, upsert=True)
-    await u.message.reply_text("✅ Added!")
+    if len(c.args) < 3: return await u.message.reply_text("Usage: /addchannel [ID] [anime/movie/series] [Tag]")
+    db.channels.update_one({"uid": OWNER_ID, "cid": c.args[0]}, {"$set": {"type": c.args[1].lower(), "tag": " ".join(c.args[2:])}}, upsert=True)
+    await u.message.reply_text("✅ Channel Added!")
 
 async def list_channels(u, c):
-    chs = list(db.channels.find({"uid": u.effective_user.id}))
-    kb = [[InlineKeyboardButton(f"❌ {ch['tag']}", callback_data=f"rm_{ch['cid']}")] for ch in chs]
+    chs = list(db.channels.find({"uid": OWNER_ID}))
+    kb = [[InlineKeyboardButton(f"❌ [{ch['type']}] {ch['tag']}", callback_data=f"rm_{ch['cid']}")] for ch in chs]
     await u.message.reply_text("Manage Channels:", reply_markup=InlineKeyboardMarkup(kb))
 
 if __name__ == '__main__':
