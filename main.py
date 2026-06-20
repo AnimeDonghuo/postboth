@@ -62,18 +62,12 @@ def advanced_title_cleaner(filename):
     if not clean_title or len(clean_title) < 3:
         clean_title = name.split('-')[0].split('(')[0].strip()
 
-    
-    clean_title = re.sub(r'\s*-\s*Episode\s*\d+.*$', '', clean_title, flags=re.I)
-    clean_title = re.sub(r'\(\d+p\)', '', clean_title, flags=re.I)
-    clean_title = clean_title.strip()
-
     return clean_title, episode, quality, year
-
 
 # --- METADATA ENGINE ---
 def get_metadata(query, year=None, med_type="anime"):
     # Strip "3D" or "2D" for search but keep "Lord of the Mysteries"
-    search_q = re.sub(r'\b(3D|2D|Part|Official)\b', '', query, flags=re.I).strip()
+    search_q = re.sub(r'\b(Part|Official)\b', '', query, flags=re.I).strip()
     
     if med_type == "anime":
         gql = 'query($s:String){Media(search:$s,type:ANIME){title{english romaji}description averageScore genres bannerImage coverImage{extraLarge}}}'
@@ -82,7 +76,7 @@ def get_metadata(query, year=None, med_type="anime"):
             data = res['data']['Media']
             return {
                 "title": data['title'].get('english') or data['title'].get('romaji'),
-                "desc": html.unescape(re.sub(r'<[^>]+>', '', data.get('description', ''))[:450] + "..."),
+                "desc": html.unescape(re.sub(r'<[^>]+>', '', data.get('description', ''))[:180] + "..."),
                 "rating": f"{data.get('averageScore', 80) / 10} / 10",
                 "genres": " ".join([f"#{g.replace(' ', '_')}" for g in data.get('genres', [])]),
                 "img": data.get('bannerImage') or data['coverImage']['extraLarge']
@@ -150,7 +144,14 @@ async def file_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     file = u.message.document or u.message.video
     if not file: return
     db_msg = await u.message.copy(chat_id=DB_CHANNEL_ID)
-    c.user_data['temp_files'].append({"msg_id": db_msg.message_id, "name": file.file_name or "Video File"})
+    real_name = u.message.caption or getattr(file, "file_name", None) or "Unknown"
+    title_tmp, ep_tmp, quality_tmp, year_tmp = advanced_title_cleaner(real_name)
+    c.user_data['temp_files'].append({
+        "msg_id": db_msg.message_id,
+        "name": real_name,
+        "quality": quality_tmp,
+        "episode": ep_tmp
+    })
     kb = [[InlineKeyboardButton("➕ Add More", callback_data="add_more")], [InlineKeyboardButton("✅ Done", callback_data="finish_auto")]]
     await u.message.reply_text(f"📥 Added {len(c.user_data['temp_files'])}.", reply_markup=InlineKeyboardMarkup(kb))
 
@@ -162,12 +163,14 @@ async def cb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         files, mode = c.user_data['temp_files'], c.user_data['mode']
         await q.edit_message_text("🔄 AI Searching Metadata...")
         title, ep, quality, year = advanced_title_cleaner(files[0]['name'])
-        print(f"AUTO TITLE = {title}")
+        qualities = sorted(list(set(f.get("quality","HD") for f in files)))
+        quality = " | ".join(qualities)
         meta = get_metadata(title, year, mode) or {"title": title, "desc": "N/A", "rating": "N/A", "genres": "#Store", "img": None}
 
         btns = []
         for f in files:
-            _, f_ep, f_q, _ = advanced_title_cleaner(f['name'])
+            f_ep = f.get("episode", "Full")
+            f_q = f.get("quality", "HD")
             res = files_db.insert_one({"msg_id": f['msg_id'], "name": f['name']})
             link_id = base64.urlsafe_b64encode(str(res.inserted_id).encode()).decode().rstrip("=")
             btns.append(InlineKeyboardButton(f"🚀 {f_q} [{f_ep}]", url=f"https://t.me/{BOT_USERNAME}?start={link_id}"))
@@ -175,6 +178,9 @@ async def cb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         network = "@Donghua_Xin" if mode == "anime" else "@Movies_Hindi_Plus"
         caption = (f"<b>{meta['title']}</b>\n<b>⟣────────────────────⟢</b>\n‣ Audio ⌯ Hindi | English\n‣ Rating ⌯ {meta['rating']}\n‣ Quality ⌯ {quality}\n‣ {'Episode' if mode == 'anime' else 'Released'} ⌯ {ep if mode == 'anime' else meta.get('date', 'N/A')}\n‣ Genres ⌯ {meta['genres']}\n<b>⟣────────────────────⟢</b>\n‣ Synopsis ⌯\n<blockquote expandable><b>{meta['desc']}</b></blockquote>\n\n🔗 <b>Our Network {network}</b>")
         
+        if len(caption) > 950:
+            caption = caption[:950] + "..."
+
         c.user_data['post_data'] = {"cap": caption, "img": meta['img'], "btns": [btns[i:i+2] for i in range(0, len(btns), 2)], "mode": mode}
         c.user_data['selected'] = []
         chs = list(channels_db.find({"type": mode}))
@@ -259,9 +265,13 @@ async def list_channels(u, c):
     msg = "<b>Channels:</b>\n" + "\n".join([f"{ch['cid']} ({ch['type']}) - {ch['tag']}" for ch in chs])
     await u.message.reply_text(msg, parse_mode='HTML')
 
+async def error_handler(update, context):
+    print("BOT ERROR:", context.error)
+
 if __name__ == '__main__':
     threading.Thread(target=run_web, daemon=True).start()
     bot = Application.builder().token(TOKEN).build()
+    bot.add_error_handler(error_handler)
     bot.add_handler(CommandHandler("start", start))
     bot.add_handler(CommandHandler("status", status))
     bot.add_handler(CommandHandler("addadmin", add_admin))
