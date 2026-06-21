@@ -36,7 +36,7 @@ def advanced_title_cleaner(filename):
     q_match = re.search(r'(\d+p|2K|4K|HD|FHD|q)', name, re.I)
     quality = q_match.group(1) if q_match else "HD"
     
-    ep_match = re.search(r'(?:Episode|episode|Ep|ep|Special|S)\s*([\w\d\.]+)', name, re.I)
+    ep_match = re.search(r'(?:Episode|episode|Ep|ep|Special)\s*([\w\d\.]+)', name, re.I)
     episode = ep_match.group(0) if ep_match else "Full"
 
     # 2. Extract Year
