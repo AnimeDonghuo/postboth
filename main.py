@@ -33,10 +33,10 @@ def advanced_title_cleaner(filename):
     name = re.sub(r'\.(mp4|mkv|zip|rar|ts|mov|avi)$', '', filename, flags=re.I)
     
     # 1. Capture Episode and Quality before cleaning
-    q_match = re.search(r'(\d+p|2K|4K|HD|FHD)', name, re.I)
+    q_match = re.search(r'(\d+p|2K|4K|HD|FHD|q)', name, re.I)
     quality = q_match.group(1) if q_match else "HD"
     
-    ep_match = re.search(r'(?:Episode|Ep|Special|S)\s*([\w\d\.]+)', name, re.I)
+    ep_match = re.search(r'(?:Episode|episode|Ep|ep|Special|S)\s*([\w\d\.]+)', name, re.I)
     episode = ep_match.group(0) if ep_match else "Full"
 
     # 2. Extract Year
@@ -176,7 +176,8 @@ async def cb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             btns.append(InlineKeyboardButton(f"🚀 {f_q} [{f_ep}]", url=f"https://t.me/{BOT_USERNAME}?start={link_id}"))
 
         network = "@Donghua_Xin" if mode == "anime" else "@Movies_Hindi_Plus"
-        caption = (f"<b>{meta['title']}</b>\n<b>⟣────────────────────⟢</b>\n‣ Audio ⌯ Hindi | English\n‣ Rating ⌯ {meta['rating']}\n‣ Quality ⌯ {quality}\n‣ {'Episode' if mode == 'anime' else 'Released'} ⌯ {ep if mode == 'anime' else meta.get('date', 'N/A')}\n‣ Genres ⌯ {meta['genres']}\n<b>⟣────────────────────⟢</b>\n‣ Synopsis ⌯\n<blockquote expandable><b>{meta['desc']}</b></blockquote>\n\n🔗 <b>Our Network {network}</b>")
+        audio = "Chinese" if mode == "anime" else "Hindi | English"
+        caption = (f"<b>{meta['title']}</b>\n<b>⟣────────────────────⟢</b>\n‣ Audio ⌯ {audio}\n‣ Rating ⌯ {meta['rating']}\n‣ Quality ⌯ {quality}\n‣ {'Episode' if mode == 'anime' else 'Released'} ⌯ {ep if mode == 'anime' else meta.get('date', 'N/A')}\n‣ Genres ⌯ {meta['genres']}\n<b>⟣────────────────────⟢</b>\n‣ Synopsis ⌯\n<blockquote expandable><b>{meta['desc']}</b></blockquote>\n\n🔗 <b>Our Network {network}</b>")
         
         if len(caption) > 950:
             caption = caption[:950] + "..."
